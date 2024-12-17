@@ -139,6 +139,8 @@
 //! [The Cargo Book]: https://doc.rust-lang.org/cargo/
 //! [Cargo Contributor Guide]: https://doc.crates.io/contrib/
 
+#![feature(file_lock)]
+
 use crate::core::shell::Verbosity::Verbose;
 use crate::core::Shell;
 use anyhow::Error;

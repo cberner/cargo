@@ -335,7 +335,7 @@ impl PartialEq<Filesystem> for Path {
     }
 }
 
-fn try_acquire(path: &Path, lock_try: &dyn Fn() -> io::Result<()>) -> CargoResult<bool> {
+fn try_acquire(path: &Path, lock_try: &dyn Fn() -> io::Result<bool>) -> CargoResult<bool> {
     // File locking on Unix is currently implemented via `flock`, which is known
     // to be broken on NFS. We could in theory just ignore errors that happen on
     // NFS, but apparently the failure mode [1] for `flock` on NFS is **blocking
@@ -352,22 +352,19 @@ fn try_acquire(path: &Path, lock_try: &dyn Fn() -> io::Result<()>) -> CargoResul
     }
 
     match lock_try() {
-        Ok(()) => return Ok(true),
+        Ok(locked) => Ok(locked),
 
         // In addition to ignoring NFS which is commonly not working we also
         // just ignore locking on filesystems that look like they don't
         // implement file locking.
-        Err(e) if error_unsupported(&e) => return Ok(true),
+        Err(e) if error_unsupported(&e) => Ok(true),
 
         Err(e) => {
-            if !error_contended(&e) {
-                let e = anyhow::Error::from(e);
-                let cx = format!("failed to lock file: {}", path.display());
-                return Err(e.context(cx));
-            }
+            let e = anyhow::Error::from(e);
+            let cx = format!("failed to lock file: {}", path.display());
+            Err(e.context(cx))
         }
     }
-    Ok(false)
 }
 
 /// Acquires a lock on a file in a "nice" manner.
@@ -389,7 +386,7 @@ fn acquire(
     gctx: &GlobalContext,
     msg: &str,
     path: &Path,
-    lock_try: &dyn Fn() -> io::Result<()>,
+    lock_try: &dyn Fn() -> io::Result<bool>,
     lock_block: &dyn Fn() -> io::Result<()>,
 ) -> CargoResult<()> {
     if cfg!(debug_assertions) {
@@ -434,28 +431,74 @@ fn is_on_nfs_mount(_path: &Path) -> bool {
 mod sys {
     use std::fs::File;
     use std::io::{Error, Result};
+    #[cfg(target_os = "solaris")]
     use std::os::unix::io::AsRawFd;
 
+    #[cfg(not(target_os = "solaris"))]
+    pub(super) fn lock_shared(file: &File) -> Result<()> {
+        file.lock_shared()
+    }
+
+    #[cfg(not(target_os = "solaris"))]
+    pub(super) fn lock_exclusive(file: &File) -> Result<()> {
+        file.lock()
+    }
+
+    #[cfg(not(target_os = "solaris"))]
+    pub(super) fn try_lock_shared(file: &File) -> Result<bool> {
+        file.try_lock_shared()
+    }
+
+    #[cfg(not(target_os = "solaris"))]
+    pub(super) fn try_lock_exclusive(file: &File) -> Result<bool> {
+        file.try_lock()
+    }
+
+    #[cfg(not(target_os = "solaris"))]
+    pub(super) fn unlock(file: &File) -> Result<()> {
+        file.unlock()
+    }
+
+    #[cfg(target_os = "solaris")]
     pub(super) fn lock_shared(file: &File) -> Result<()> {
         flock(file, libc::LOCK_SH)
     }
 
+    #[cfg(target_os = "solaris")]
     pub(super) fn lock_exclusive(file: &File) -> Result<()> {
         flock(file, libc::LOCK_EX)
     }
 
-    pub(super) fn try_lock_shared(file: &File) -> Result<()> {
-        flock(file, libc::LOCK_SH | libc::LOCK_NB)
+    #[cfg(target_os = "solaris")]
+    pub(super) fn try_lock_shared(file: &File) -> Result<bool> {
+        if let Err(e) = flock(file, libc::LOCK_SH | libc::LOCK_NB) {
+            if error_contended(&e) {
+                Ok(false)
+            } else {
+                Err(e)
+            }
+        }
+        Ok(true)
     }
 
-    pub(super) fn try_lock_exclusive(file: &File) -> Result<()> {
-        flock(file, libc::LOCK_EX | libc::LOCK_NB)
+    #[cfg(target_os = "solaris")]
+    pub(super) fn try_lock_exclusive(file: &File) -> Result<bool> {
+        if let Err(e) = flock(file, libc::LOCK_EX | libc::LOCK_NB) {
+            if error_contended(&e) {
+                Ok(false)
+            } else {
+                Err(e)
+            }
+        }
+        Ok(true)
     }
 
+    #[cfg(target_os = "solaris")]
     pub(super) fn unlock(file: &File) -> Result<()> {
         flock(file, libc::LOCK_UN)
     }
 
+    #[cfg(target_os = "solaris")]
     pub(super) fn error_contended(err: &Error) -> bool {
         err.raw_os_error().map_or(false, |x| x == libc::EWOULDBLOCK)
     }
@@ -468,16 +511,6 @@ mod sys {
             Some(libc::ENOTSUP | libc::EOPNOTSUPP) => true,
             Some(libc::ENOSYS) => true,
             _ => false,
-        }
-    }
-
-    #[cfg(not(target_os = "solaris"))]
-    fn flock(file: &File, flag: libc::c_int) -> Result<()> {
-        let ret = unsafe { libc::flock(file.as_raw_fd(), flag) };
-        if ret < 0 {
-            Err(Error::last_os_error())
-        } else {
-            Ok(())
         }
     }
 
@@ -532,58 +565,27 @@ mod sys {
     };
 
     pub(super) fn lock_shared(file: &File) -> Result<()> {
-        lock_file(file, 0)
+        file.lock_shared()
     }
 
     pub(super) fn lock_exclusive(file: &File) -> Result<()> {
-        lock_file(file, LOCKFILE_EXCLUSIVE_LOCK)
+        file.lock()
     }
 
-    pub(super) fn try_lock_shared(file: &File) -> Result<()> {
-        lock_file(file, LOCKFILE_FAIL_IMMEDIATELY)
+    pub(super) fn try_lock_shared(file: &File) -> Result<bool> {
+        file.try_lock_shared()
     }
 
-    pub(super) fn try_lock_exclusive(file: &File) -> Result<()> {
-        lock_file(file, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY)
+    pub(super) fn try_lock_exclusive(file: &File) -> Result<bool> {
+        file.try_lock()
     }
 
-    pub(super) fn error_contended(err: &Error) -> bool {
-        err.raw_os_error()
-            .map_or(false, |x| x == ERROR_LOCK_VIOLATION as i32)
+    pub(super) fn unlock(file: &File) -> Result<()> {
+        file.unlock()
     }
 
     pub(super) fn error_unsupported(err: &Error) -> bool {
         err.raw_os_error()
             .map_or(false, |x| x == ERROR_INVALID_FUNCTION as i32)
-    }
-
-    pub(super) fn unlock(file: &File) -> Result<()> {
-        unsafe {
-            let ret = UnlockFile(file.as_raw_handle() as HANDLE, 0, 0, !0, !0);
-            if ret == 0 {
-                Err(Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        }
-    }
-
-    fn lock_file(file: &File, flags: u32) -> Result<()> {
-        unsafe {
-            let mut overlapped = mem::zeroed();
-            let ret = LockFileEx(
-                file.as_raw_handle() as HANDLE,
-                flags,
-                0,
-                !0,
-                !0,
-                &mut overlapped,
-            );
-            if ret == 0 {
-                Err(Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        }
     }
 }
